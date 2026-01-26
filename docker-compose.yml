@@ -64,9 +64,10 @@ services:
       - RABBITMQ_HOST=rabbitmq
       - TARGET_EXCHANGE=processing_exchange # Escucha eventos válidos
       - LOG_FILE_PATH=/data/audit_log.jsonl
+      - AUDIT_DB_PATH=/data/audit.db
     volumes:
-      # Mapea la carpeta local './audit_data' a '/data' dentro del contenedor
-      - ./audit_data:/data
+      # Mapea la carpeta local './data' a '/data' dentro del contenedor
+      - ./data:/data
   
   # --- NUEVO SERVICIO: DASHBOARD (Paso 5) ---
   dashboard:
