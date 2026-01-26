@@ -1,0 +1,82 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Paso 1
+  publisher:
+    build: ./publisher
+    container_name: publisher
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+      - EXCHANGE_NAME=events_exchange
+      # --- Configuración del Laboratorio ---
+      - EVENT_RATE=1.0        # 1 evento por segundo (Cámbialo a 5.0 o 10.0 para estrés)
+      - ENABLE_BURST=false    # Pon 'true' para probar picos de carga
+      - REGIONS=norte,sur,centro,este,oeste
+
+  # Paso 2
+  validator:
+    build: ./validator
+    container_name: validator
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+      - INPUT_EXCHANGE=events_exchange
+      - OUTPUT_EXCHANGE=processing_exchange
+      - DLQ_EXCHANGE=dlq_exchange
+
+  # Paso 3
+  aggregator:
+    build: ./aggregator
+    container_name: aggregator
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+      - INPUT_EXCHANGE=processing_exchange
+      - OUTPUT_EXCHANGE=analytics_exchange
+      - AGGREGATION_WINDOW=10.0
+
+  # --- NUEVO SERVICIO: AUDIT (Paso 4) ---
+  audit:
+    build: ./audit
+    container_name: audit
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+      - TARGET_EXCHANGE=processing_exchange # Escucha eventos válidos
+      - LOG_FILE_PATH=/data/audit_log.jsonl
+    volumes:
+      # Mapea la carpeta local './audit_data' a '/data' dentro del contenedor
+      - ./audit_data:/data
+  
+  # --- NUEVO SERVICIO: DASHBOARD (Paso 5) ---
+  dashboard:
+    build: ./dashboard
+    container_name: dashboard
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    ports:
+      - "5000:5000"  # Acceso desde http://localhost:5000
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+      - WEB_PORT=5000

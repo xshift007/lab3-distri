@@ -1,1 +1,1 @@
-# lab3-distri
+# lab3-Sistemas_distribuidos
