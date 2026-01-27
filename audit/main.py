@@ -9,24 +9,31 @@ import pika
 
 import settings
 
+
 def connect_rabbitmq():
     while True:
         try:
-            params = pika.ConnectionParameters(host=settings.RABBIT_HOST, port=settings.RABBIT_PORT)
+            params = pika.ConnectionParameters(
+                host=settings.RABBIT_HOST,
+                port=settings.RABBIT_PORT,
+                heartbeat=60,
+                blocked_connection_timeout=120,
+            )
             connection = pika.BlockingConnection(params)
             channel = connection.channel()
 
             # Aseguramos que los exchanges existan (por si Audit levanta antes que otros servicios)
-            channel.exchange_declare(exchange=settings.TARGET_EXCHANGE, exchange_type='topic', durable=True)
-            channel.exchange_declare(exchange=settings.METRICS_EXCHANGE, exchange_type='topic', durable=True)
+            channel.exchange_declare(exchange=settings.TARGET_EXCHANGE, exchange_type="topic", durable=True)
+            channel.exchange_declare(exchange=settings.METRICS_EXCHANGE, exchange_type="topic", durable=True)
 
-            # Declaramos una cola DURABLE y EXCLUSIVA para Audit
-            # Así aseguramos que si Audit se cae, los mensajes se acumulan en RabbitMQ
+            # Colas DURABLES (si Audit se cae, RabbitMQ conserva mensajes)
             channel.queue_declare(queue=settings.QUEUE_NAME, durable=True)
             channel.queue_declare(queue=settings.METRICS_QUEUE_NAME, durable=True)
 
-            # Binding con '#' para escuchar TODO lo que entre al exchange
+            # Escuchar TODO lo que entra al exchange principal
             channel.queue_bind(exchange=settings.TARGET_EXCHANGE, queue=settings.QUEUE_NAME, routing_key="#")
+
+            # Escuchar routing key de métricas
             channel.queue_bind(
                 exchange=settings.METRICS_EXCHANGE,
                 queue=settings.METRICS_QUEUE_NAME,
@@ -35,33 +42,40 @@ def connect_rabbitmq():
 
             print(f"[*] Audit Service conectado. Guardando en {settings.LOG_FILE_PATH}")
             return connection, channel
+
         except pika.exceptions.AMQPConnectionError:
-            print(f"[!] Esperando a RabbitMQ...")
+            print("[!] Esperando a RabbitMQ...")
             time.sleep(5)
 
-def append_to_log(event_body):
-    """Escribe el evento en un archivo (JSON Lines format)"""
+
+def append_to_log(event_body: bytes) -> None:
+    """Escribe el evento en un archivo (JSON Lines). Best-effort."""
     try:
-        # Decodificamos para asegurar que es texto, o si queremos agregar metadata extra
         data = json.loads(event_body)
-        
-        # Agregamos timestamp de auditoría (cuándo lo guardamos)
+
         audit_entry = {
             "audit_timestamp": datetime.now().isoformat(),
-            "event_content": data
+            "event_content": data,
         }
 
-        # Abrimos en modo 'append' (a). 
-        # En producción, esto debería rotar logs o ir a Elasticsearch.
-        with open(settings.LOG_FILE_PATH, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(audit_entry) + "\n")
-            
+        with open(settings.LOG_FILE_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(audit_entry, ensure_ascii=False) + "\n")
+
     except Exception as e:
-        print(f"[!] Error escribiendo en disco: {e}")
+        # No abortamos la auditoría DB por falla de archivo, pero lo reportamos.
+        print(f"[!] Error escribiendo log en disco: {e}")
+
 
 def init_db(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn = sqlite3.connect(db_path, check_same_thread=False, timeout=5)
+
+    # Pragmas: concurrencia y consistencia
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    conn.execute("PRAGMA busy_timeout=5000;")  # ms
+
+    # Schema
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS events_in (
@@ -104,13 +118,19 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn.commit()
     return conn
 
+
 def get_run_id(properties, payload: dict) -> str:
     headers = getattr(properties, "headers", None) or {}
     return headers.get("run_id") or payload.get("run_id") or "default"
 
+
 def store_event(conn: sqlite3.Connection, event: dict, run_id: str) -> None:
+    """
+    Solo ejecuta INSERT. El COMMIT lo hace el caller (transacción en handle_event).
+    """
     if not event.get("event_id") or not event.get("timestamp") or not event.get("region") or not event.get("source"):
-        raise ValueError("Evento inválido: faltan campos requeridos")
+        raise ValueError("Evento inválido: faltan campos requeridos (event_id, timestamp, region, source)")
+
     conn.execute(
         """
         INSERT OR IGNORE INTO events_in
@@ -128,9 +148,13 @@ def store_event(conn: sqlite3.Connection, event: dict, run_id: str) -> None:
             run_id,
         ),
     )
-    conn.commit()
+
 
 def store_metric_and_trace(conn: sqlite3.Connection, metric_msg: dict) -> None:
+    """
+    Inserta metrics_out + trace en UNA sola transacción (caller).
+    Si falla un trace por FK, se revierte TODO (métrica incluida).
+    """
     metric_id = metric_msg.get("metric_id") or str(uuid.uuid4())
     date = metric_msg["date"]
     region = metric_msg["region"]
@@ -154,64 +178,81 @@ def store_metric_and_trace(conn: sqlite3.Connection, metric_msg: dict) -> None:
             (event_id, metric_id),
         )
 
-    conn.commit()
 
-def handle_event(conn, ch, method, properties, body):
-    # 1. Escribir en persistencia
+def handle_event(conn: sqlite3.Connection, ch, method, properties, body: bytes):
     append_to_log(body)
 
     try:
         event = json.loads(body)
         run_id = get_run_id(properties, event)
-        store_event(conn, event, run_id)
-    except Exception as e:
-        print(f"[!] Error guardando evento en DB: {e}")
 
-    # 2. Imprimir en consola (para ver que funciona en docker logs)
-    print(f" [A] Auditado evento con RK: {method.routing_key}")
+        with conn:  # transacción atómica
+            store_event(conn, event, run_id)
 
-    # 3. Confirmar a RabbitMQ
-    ch.basic_ack(delivery_tag=method.delivery_tag)
-
-def handle_metric(conn, ch, method, properties, body):
-    try:
-        metric_msg = json.loads(body)
-        store_metric_and_trace(conn, metric_msg)
-        print(f" [M] Métrica auditada con RK: {method.routing_key}")
-    except Exception as e:
-        print(f"[!] Error guardando métrica en DB: {e}")
-    finally:
+        print(f" [A] Auditado evento con RK: {method.routing_key}")
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
+    except json.JSONDecodeError as e:
+        print(f"[!] Evento no es JSON válido. Se descarta. Error: {e}")
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+
+    except (sqlite3.OperationalError, sqlite3.IntegrityError) as e:
+        print(f"[!] Error DB guardando evento (requeue): {e}")
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+
+    except Exception as e:
+        print(f"[!] Error inesperado guardando evento (requeue): {e}")
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+
+
+def handle_metric(conn: sqlite3.Connection, ch, method, properties, body: bytes):
+    try:
+        metric_msg = json.loads(body)
+
+        with conn:  # métrica + trazas juntas o nada
+            store_metric_and_trace(conn, metric_msg)
+
+        print(f" [M] Métrica auditada con RK: {method.routing_key}")
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+
+    except json.JSONDecodeError as e:
+        print(f"[!] Métrica no es JSON válido. Se descarta. Error: {e}")
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+
+    except (sqlite3.OperationalError, sqlite3.IntegrityError) as e:
+        print(f"[!] Error DB guardando métrica/trace (requeue): {e}")
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+
+    except Exception as e:
+        print(f"[!] Error inesperado guardando métrica (requeue): {e}")
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+
+
 def main():
-    # Asegurar que el directorio de logs exista
     os.makedirs(os.path.dirname(settings.LOG_FILE_PATH), exist_ok=True)
     os.makedirs(os.path.dirname(settings.AUDIT_DB_PATH), exist_ok=True)
 
     conn = init_db(settings.AUDIT_DB_PATH)
 
     connection, channel = connect_rabbitmq()
-    
+
     channel.basic_qos(prefetch_count=1)
     channel.basic_consume(
         queue=settings.QUEUE_NAME,
-        on_message_callback=lambda ch, method, properties, body: handle_event(
-            conn, ch, method, properties, body
-        ),
+        on_message_callback=lambda ch, method, properties, body: handle_event(conn, ch, method, properties, body),
     )
     channel.basic_consume(
         queue=settings.METRICS_QUEUE_NAME,
-        on_message_callback=lambda ch, method, properties, body: handle_metric(
-            conn, ch, method, properties, body
-        ),
+        on_message_callback=lambda ch, method, properties, body: handle_metric(conn, ch, method, properties, body),
     )
-    
-    print(' [*] Audit Service grabando eventos...')
+
+    print(" [*] Audit Service grabando eventos...")
     try:
         channel.start_consuming()
     except KeyboardInterrupt:
         channel.stop_consuming()
         connection.close()
+
 
 if __name__ == "__main__":
     main()
