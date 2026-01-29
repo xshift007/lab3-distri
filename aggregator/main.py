@@ -105,7 +105,6 @@ def process_event(event):
         event_ids_by_region.setdefault(region, set()).add(event_id)
 
 def callback(ch, method, properties, body):
-    global current_window_start
     
     try:
         event = json.loads(body)

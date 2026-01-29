@@ -22,9 +22,11 @@ services:
       - RABBITMQ_HOST=rabbitmq
       - RABBITMQ_PORT=5672
       - EXCHANGE_NAME=events_exchange
-      # --- Configuración del Laboratorio ---
-      - EVENT_RATE=1.0        # 1 evento por segundo (Cámbialo a 5.0 o 10.0 para estrés)
-      - ENABLE_BURST=false    # Pon 'true' para probar picos de carga
+      # --- AQUI ESTA LA MAGIA ---
+      # Si ejecutas el script run_burst.sh, este tomará el valor 50.0
+      # Si ejecutas docker compose up normal, tomará el valor 1.0
+      - EVENT_RATE=${EVENT_RATE:-1.0}
+      - ENABLE_BURST=${ENABLE_BURST:-false}
       - REGIONS=norte,sur,centro,este,oeste
 
   # Paso 2
@@ -51,7 +53,8 @@ services:
       - RABBITMQ_HOST=rabbitmq
       - INPUT_EXCHANGE=processing_exchange
       - OUTPUT_EXCHANGE=analytics_exchange
-      - AGGREGATION_WINDOW=10.0
+      # También parametrizamos la ventana por si quieres cambiarla en el futuro
+      - AGGREGATION_WINDOW=${AGGREGATION_WINDOW:-10.0}
 
   # --- NUEVO SERVICIO: AUDIT (Paso 4) ---
   audit:
@@ -62,11 +65,10 @@ services:
         condition: service_healthy
     environment:
       - RABBITMQ_HOST=rabbitmq
-      - TARGET_EXCHANGE=processing_exchange # Escucha eventos válidos
+      - TARGET_EXCHANGE=processing_exchange 
       - LOG_FILE_PATH=/data/audit_log.jsonl
       - AUDIT_DB_PATH=/data/audit.db
     volumes:
-      # Mapea la carpeta local './data' a '/data' dentro del contenedor
       - ./data:/data
   
   # --- NUEVO SERVICIO: DASHBOARD (Paso 5) ---
@@ -77,7 +79,7 @@ services:
       rabbitmq:
         condition: service_healthy
     ports:
-      - "5000:5000"  # Acceso desde http://localhost:5000
+      - "5000:5000"
     environment:
       - RABBITMQ_HOST=rabbitmq
       - WEB_PORT=5000

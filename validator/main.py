@@ -1,10 +1,15 @@
 import json
 import time
+import random
 import pika
 import jsonschema
 from jsonschema import validate
 import settings
 import schemas
+
+# Configuración de Retries
+MAX_RETRIES = 3
+BASE_BACKOFF = 1.0 # Segundos
 
 def connect_rabbitmq():
     """Conexión robusta con reintentos"""
@@ -60,52 +65,138 @@ def validate_event(event_data):
     except Exception as e:
         return False, f"Error inesperado: {str(e)}"
 
+# def callback(ch, method, properties, body):
+#     """Función que procesa cada mensaje"""
+#     print(f" [>] Recibido: {method.routing_key}")
+    
+#     try:
+#         event_data = json.loads(body)
+#         is_valid, error_msg = validate_event(event_data)
+
+#         if is_valid:
+#             # === CASO ÉXITO ===
+#             # Re-publicamos al exchange de procesamiento (OUTPUT)
+#             # Mantenemos el mismo routing_key para que el Aggregator sepa qué es
+#             ch.basic_publish(
+#                 exchange=settings.OUTPUT_EXCHANGE,
+#                 routing_key=method.routing_key, 
+#                 body=body,
+#                 properties=pika.BasicProperties(delivery_mode=2) # Persistente
+#             )
+#             print(f" [V] Válido. Reenviado a {settings.OUTPUT_EXCHANGE}")
+
+#         else:
+#             # === CASO ERROR (DLQ) ===
+#             # Envolvemos el mensaje original con metadata del error [cite: 222]
+#             dlq_message = {
+#                 "original_event": event_data,
+#                 "error": error_msg,
+#                 "failed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+#                 "service": "validator"
+#             }
+            
+#             ch.basic_publish(
+#                 exchange=settings.DLQ_EXCHANGE,
+#                 routing_key="deadletter.validation",
+#                 body=json.dumps(dlq_message),
+#                 properties=pika.BasicProperties(delivery_mode=2)
+#             )
+#             print(f" [X] Inválido ({error_msg}). Enviado a DLQ.")
+
+#     except json.JSONDecodeError:
+#         # Si ni siquiera es JSON, mandar a DLQ como texto plano
+#         print(" [!] Error: No es un JSON válido")
+#         # (Aquí podrías implementar lógica para mandar el raw body a DLQ)
+
+#     finally:
+#         # IMPORTANTE: Confirmar procesamiento (At-Least-Once) 
+#         ch.basic_ack(delivery_tag=method.delivery_tag)
+
+
 def callback(ch, method, properties, body):
-    """Función que procesa cada mensaje"""
+    """Procesa mensajes con política de Retry (Exponential Backoff)"""
     print(f" [>] Recibido: {method.routing_key}")
     
-    try:
-        event_data = json.loads(body)
-        is_valid, error_msg = validate_event(event_data)
+    retry_count = 0
+    
+    while retry_count <= MAX_RETRIES:
+        try:
+            # --- SIMULACIÓN DE CAOS (Para demostrar el Retry al profesor) ---
+            # Descomenta las siguientes 2 lineas para probar fallos transitorios:
+            #if random.random() < 0.3 and retry_count < 2: 
+            #    raise Exception("Simulando fallo transitorio de red/DB")
+            # ---------------------------------------------------------------
 
-        if is_valid:
-            # === CASO ÉXITO ===
-            # Re-publicamos al exchange de procesamiento (OUTPUT)
-            # Mantenemos el mismo routing_key para que el Aggregator sepa qué es
-            ch.basic_publish(
-                exchange=settings.OUTPUT_EXCHANGE,
-                routing_key=method.routing_key, 
-                body=body,
-                properties=pika.BasicProperties(delivery_mode=2) # Persistente
-            )
-            print(f" [V] Válido. Reenviado a {settings.OUTPUT_EXCHANGE}")
+            try:
+                event_data = json.loads(body)
+            except json.JSONDecodeError:
+                # Error permanente: No es JSON. A DLQ directo.
+                print(" [!] Error Fatal: No es un JSON válido.")
+                send_to_dlq(ch, method, body, "Invalid JSON", "validator")
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+                return
 
-        else:
-            # === CASO ERROR (DLQ) ===
-            # Envolvemos el mensaje original con metadata del error [cite: 222]
-            dlq_message = {
-                "original_event": event_data,
-                "error": error_msg,
-                "failed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "service": "validator"
-            }
+            # Validación de Negocio
+            is_valid, error_msg = validate_event(event_data)
+
+            if is_valid:
+                # Éxito: Enviar al exchange de procesamiento
+                ch.basic_publish(
+                    exchange=settings.OUTPUT_EXCHANGE,
+                    routing_key=method.routing_key, 
+                    body=body,
+                    properties=pika.BasicProperties(delivery_mode=2)
+                )
+                print(f" [V] Válido. Reenviado a {settings.OUTPUT_EXCHANGE}")
+            else:
+                # Error de Negocio (Permanente): A DLQ directo.
+                # No reintentamos porque el dato está malo siempre.
+                send_to_dlq(ch, method, body, error_msg, "validator")
+                print(f" [X] Inválido ({error_msg}). Enviado a DLQ.")
+
+            # Si llegamos aquí sin excepción, todo salió bien. Confirmamos y salimos.
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            return
+
+        except Exception as e:
+            # === MANEJO DE ERRORES TRANSITORIOS ===
+            print(f" [!] Error transitorio (Intento {retry_count+1}/{MAX_RETRIES+1}): {e}")
             
-            ch.basic_publish(
-                exchange=settings.DLQ_EXCHANGE,
-                routing_key="deadletter.validation",
-                body=json.dumps(dlq_message),
-                properties=pika.BasicProperties(delivery_mode=2)
-            )
-            print(f" [X] Inválido ({error_msg}). Enviado a DLQ.")
+            if retry_count < MAX_RETRIES:
+                # Calculamos espera: 1s, 2s, 4s... (Exponential Backoff)
+                sleep_time = BASE_BACKOFF * (2 ** retry_count)
+                print(f"     ... Reintentando en {sleep_time} segundos.")
+                time.sleep(sleep_time)
+                retry_count += 1
+                continue # Vuelve al inicio del while
+            else:
+                # Se acabaron los intentos. A DLQ.
+                print(" [!!!] Agotados los reintentos. Moviendo a DLQ.")
+                send_to_dlq(ch, method, body, f"Max retries exceeded: {str(e)}", "validator")
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+                return
 
-    except json.JSONDecodeError:
-        # Si ni siquiera es JSON, mandar a DLQ como texto plano
-        print(" [!] Error: No es un JSON válido")
-        # (Aquí podrías implementar lógica para mandar el raw body a DLQ)
+def send_to_dlq(ch, method, body, error_msg, service_name):
+    """Helper para enviar a DLQ"""
+    # Intentamos parsear para envolver, si falla mandamos raw
+    try:
+        original_event = json.loads(body)
+    except:
+        original_event = body.decode('utf-8', errors='ignore')
 
-    finally:
-        # IMPORTANTE: Confirmar procesamiento (At-Least-Once) 
-        ch.basic_ack(delivery_tag=method.delivery_tag)
+    dlq_message = {
+        "original_event": original_event,
+        "error": error_msg,
+        "failed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "service": service_name
+    }
+    
+    ch.basic_publish(
+        exchange=settings.DLQ_EXCHANGE,
+        routing_key="deadletter.validation",
+        body=json.dumps(dlq_message),
+        properties=pika.BasicProperties(delivery_mode=2)
+    )
 
 def main():
     connection, channel = connect_rabbitmq()
