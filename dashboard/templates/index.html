@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Sistema de Monitoreo - País X</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; background: #f0f2f5; }
+        .card { background: white; padding: 20px; margin-bottom: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1 { color: #1a1a1a; }
+        pre { background: #333; color: #0f0; padding: 15px; border-radius: 5px; overflow-x: auto; }
+        .stat-box { display: inline-block; padding: 15px; margin: 10px; background: #e3f2fd; border-radius: 5px; min-width: 150px; text-align: center; }
+        .stat-number { font-size: 24px; font-weight: bold; color: #1565c0; }
+    </style>
+</head>
+<body>
+    <h1>📊 Dashboard de Eventos en Tiempo Real</h1>
+    
+    <div class="card">
+        <h3>Última Ventana Procesada</h3>
+        <div id="stats-container">Esperando datos...</div>
+    </div>
+
+    <div class="card">
+        <h3>JSON Crudo (Live)</h3>
+        <pre id="raw-json">Esperando eventos del Aggregator...</pre>
+    </div>
+
+    <script>
+        async function fetchData() {
+            try {
+                const response = await fetch('/data');
+                const data = await response.json();
+                
+                // Actualizar JSON crudo
+                document.getElementById('raw-json').innerText = JSON.stringify(data, null, 2);
+
+                // Actualizar Estadísticas visuales
+                if (data.stats_by_region) {
+                    let html = '';
+                    for (const [region, counts] of Object.entries(data.stats_by_region)) {
+                        let total = Object.values(counts).reduce((a, b) => a + b, 0);
+                        html += `
+                            <div class="stat-box">
+                                <div>${region.toUpperCase()}</div>
+                                <div class="stat-number">${total}</div>
+                                <div style="font-size:0.8em">eventos</div>
+                            </div>
+                        `;
+                    }
+                    document.getElementById('stats-container').innerHTML = html;
+                }
+            } catch (e) {
+                console.error("Error fetching data", e);
+            }
+        }
+
+        // Refrescar cada 2 segundos
+        setInterval(fetchData, 2000);
+        fetchData();
+    </script>
+</body>
+</html>
